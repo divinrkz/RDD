@@ -130,15 +130,15 @@ def compute_rdx_triplet_table(emb_s, emb_t, anchor_idx=None,
     """
     For every sample, find its RDX positive and negative.
 
-    * **positive** — argmax of teacher-unique affinity (am_10):
+    * **positive** — argmax of teacher-unique affinity (A^{01}):
       the anchor point whose teacher groups it with the sample but
       the student does not.  The student should *pull* toward it.
-    * **negative** — argmax of student-unique affinity (am_01):
+    * **negative** — argmax of student-unique affinity (A^{10}):
       the anchor point whose student groups it with the sample but
       the teacher does not.  The student should *push* away from it.
 
     Both are derived from a single diff vector per row:
-    ``am_10 = exp(-β·diff)`` and ``am_01 = exp(β·diff)`` so
+    ``A^{01} = exp(-β·diff)`` and ``A^{10} = exp(β·diff)`` so
     positive = argmin(diff), negative = argmax(diff).
 
     Args:
@@ -148,8 +148,8 @@ def compute_rdx_triplet_table(emb_s, emb_t, anchor_idx=None,
     Returns:
         pos_idx: (N,) int64 array — global dataset index of each positive.
         neg_idx: (N,) int64 array — global dataset index of each negative.
-        weights: (N,) float32 array — average of teacher-unique (am_10)
-                 and student-unique (am_01) affinities for the selected
+        weights: (N,) float32 array — average of teacher-unique (A^{01})
+                 and student-unique (A^{10}) affinities for the selected
                  positive and negative, capturing overall RDX signal strength.
     """
     N = len(emb_s)
@@ -179,8 +179,8 @@ def compute_rdx_triplet_table(emb_s, emb_t, anchor_idx=None,
         neg_cols = diff.argmax(dim=1)
 
         row_idx = torch.arange(B, device=device)
-        pos_aff = torch.exp(-beta * diff[row_idx, pos_cols])   # am_10
-        neg_aff = torch.exp(beta * diff[row_idx, neg_cols])    # am_01
+        pos_aff = torch.exp(-beta * diff[row_idx, pos_cols])   # A^{01}
+        neg_aff = torch.exp(beta * diff[row_idx, neg_cols])    # A^{10}
         weights[start:end] = ((pos_aff + neg_aff) / 2).cpu().numpy()
 
         pos_cols = pos_cols.cpu().numpy()

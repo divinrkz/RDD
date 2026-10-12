@@ -1,169 +1,144 @@
-# Representation Difference Distillation (RDD)
+# Representational Difference Distillation (RDD)
 
-This repo contains the implementation of 
-[Representational Difference Distillation](https://drive.google.com/file/d/1Is9-a2ZMwBdPYS7piE1mn8NuHTZYFg_p/view), a knowledge distillation method that exploits representational differences between teacher and student models. Read the blog [here](https://divinrkz.com/blog/research/rdd-distillation).
+Code for **Representational Difference Distillation**
+([paper](https://drive.google.com/file/d/1Is9-a2ZMwBdPYS7piE1mn8NuHTZYFg_p/view),
+[blog post](https://divinrkz.com/blog/research/rdd-distillation)), a knowledge distillation method
+that uses [Representational Difference Explanations (RDX)](https://arxiv.org/abs/2505.23917) to find
+where the teacher's and student's representations disagree, and focuses the distillation loss there.
 
+![RDD overview](assets/rdd-overview.png)
 
+## How it works
 
-## Overview
+**A. RDX diagnostic (every R epochs, no gradient).** Both networks embed the training set. For every
+pair of samples, RDX compares the neighbor rank of `j` around `i` in the teacher and in the student,
+and turns the difference into two directional affinities:
 
-RDD is a knowledge distillation framework that uses representational difference analysis to focus the distillation loss where the teacher and student structurally disagree.
+- `A01`: **teacher-unique** pairs (close for the teacher, far for the student)
+- `A10`: **student-unique** pairs (close for the student, far for the teacher)
 
-**Core components:**
+From these, each sample `i` gets a positive `p_i = argmax_j A01[i, j]`, a pool of `P` candidate
+negatives (top `A10[i, :]`), and a confusion weight `c_i = mean_j (A01[i, j] + A10[i, j])`.
 
-- **Asymmetric affinity matrices** (A01 / A10) that capture directional representational relationships between teacher and student
-- **Momentum memory bank** for efficient, stable contrastive estimation across the dataset
-- **constrastive loss** that smoothly encourages the student's representations to align with the teacher's in the disagreement region
-- **Per-sample confusion weighting** that up-weights samples in the student's zone of proximal development — where learning signal is richest
+**B. Training step (every mini-batch).** As in [CRD](https://arxiv.org/abs/1910.10699), student
+features are projected and contrasted against a momentum memory bank of projected teacher features.
+RDD changes *which* entries are contrasted (pull toward `p_i`, push away from negatives sampled from
+the pool) and *how much* each anchor counts (loss weighted by `c_i / mean(c)`).
+
+The full N x N affinity matrix is never materialized: RDX is computed one block of rows at a time,
+optionally against a random subset of anchor samples (`--rdx_anchor_n`).
+
+## Results
+
+CIFAR-100, resnet32x4 → resnet8x4, final-epoch top-1 test accuracy (%). **Single run per method**:
+the RDD vs. CRD gap is within typical seed-to-seed variation, so treat the two as on par.
+
+| Method | Test acc. |
+| --- | --- |
+| KD | 72.93 |
+| RKD | 71.55 |
+| CRD | 75.45 |
+| RDD sampling (15% subset, refreshed) | 59.49 |
+| RDD curriculum | 72.96 |
+| **RDD supervision** | 75.58 |
+
+Teacher (resnet32x4): 79.42% ([Tian et al., 2020](https://arxiv.org/abs/1910.10699)).
 
 ## Installation
 
-This repo was tested with Python 3.8+, PyTorch ≥ 1.10, and CUDA 11.x on Ubuntu.
+Tested with Python 3.8+, PyTorch ≥ 1.10, and CUDA 11.x on Ubuntu.
 
 ```bash
 pip install -r requirements.txt
+sh scripts/fetch_pretrained_teachers.sh   # downloads pretrained teachers to save/models/
 ```
 
-## Running
+## Reproducing the table
 
-### 1. Fetch pretrained teacher models
+All runs use the same recipe: SGD (momentum 0.9, weight decay 5e-4), lr 0.05 decayed by 0.1 at
+epochs 150/180/210, 240 epochs, batch size 64. `-r`, `-a`, `-b` are the weights of the CE, KD and
+method-specific losses.
 
 ```bash
-sh scripts/fetch_pretrained_teachers.sh
+T=./save/models/resnet32x4_vanilla/ckpt_epoch_240.pth
+
+# RDD supervision (same loss weights as CRD: no KD term; RDX beta 0.8, refreshed every 20 epochs)
+python train_student.py --path_t $T --model_s resnet8x4 --distill rdx_contrast -r 1 -a 0 -b 0.8 \
+  --rdx_beta 0.8 --rdx_refresh_epochs 20 --trial 1
+
+# RDD curriculum (KD loss + RDX easiest-first curriculum)
+python train_student.py --path_t $T --model_s resnet8x4 --distill kd -r 0.1 -a 0.9 -b 0 \
+  --sampling curriculum --curriculum_start_frac 0.3 --curriculum_pace_epochs 100 --trial 1
+
+# Baselines
+python train_student.py --path_t $T --model_s resnet8x4 --distill kd  -r 0.1 -a 0.9 -b 0   --trial 1
+python train_student.py --path_t $T --model_s resnet8x4 --distill crd -r 1   -a 0   -b 0.8 --trial 1
+python train_student.py --path_t $T --model_s resnet8x4 --distill rkd -r 1   -a 0   -b 1   --trial 1
 ```
 
-This downloads pretrained teachers to `save/models/`.
+To combine RDD with KD, set `-a` to a non-zero value (e.g. `-a 1`).
 
-### 2. Run RDD distillation
+### RDX options
+
+| Flag | Description |
+| --- | --- |
+| `--rdx_gamma` | Saturation γ of the locally-biased difference (default: `0.1`) |
+| `--rdx_beta` | Affinity sharpness β; only affects the weights `c_i` (default: `5.0`) |
+| `--rdx_start_epoch` | First epoch at which RDX is computed (default: `1`) |
+| `--rdx_refresh_epochs` | Recompute RDX every N epochs (`0` = compute once; default: `0`) |
+| `--rdx_anchor_n` | Number of anchor samples for RDX (`0` = all; default: `0`) |
+| `--rdx_kna_k` | Top-k affinities summed for curriculum difficulty scores (default: `8`) |
+| `--sampling` | `standard` (default) or `curriculum` |
+| `--curriculum_start_frac` | Initial fraction of easiest samples (default: `0.3`) |
+| `--curriculum_pace_epochs` | Epochs to ramp to the full training set (default: `100`) |
+
+Example: same as the paper's RDD run, but scoring against 2048 anchors (much cheaper than all 50k samples):
 
 ```bash
-python train_student.py \
-  --path_t ./save/models/resnet32x4_vanilla/ckpt_epoch_240.pth \
-  --distill rdx_contrast \
-  --model_s resnet8x4 \
-  -a 0 -b 0.8 \
-  --trial 1
+python train_student.py --path_t $T --model_s resnet8x4 --distill rdx_contrast -r 1 -a 0 -b 0.8 \
+  --rdx_beta 0.8 --rdx_refresh_epochs 20 --rdx_anchor_n 2048 --trial 1
 ```
 
-**Flags:**
+To train teachers from scratch instead of downloading them: `sh scripts/run_cifar_vanilla.sh`.
 
-
-| Flag        | Description                                     |
-| ----------- | ----------------------------------------------- |
-| `--path_t`  | Path to the pretrained teacher model            |
-| `--model_s` | Student architecture (see `models/__init__.py`) |
-| `--distill` | Distillation method (`rdx_contrast` for RDD)    |
-| `-r`        | Weight of cross-entropy loss (default: `1`)     |
-| `-a`        | Weight of KD loss (default: `None`)             |
-| `-b`        | Weight of the RDD loss (default: `None`)        |
-| `--trial`   | Experiment ID for multiple runs                 |
-
-
-#### RDD sampling examples
-
-Training uses **RDX scoring** to mine positives, negatives, and optional per-sample weights. The examples below show curriculum scheduling on the training set, periodic re-mining, and cheaper scoring with a subset of anchors.
-
-**RDX curriculum** (easiest-first scheduling; works with `rdx_contrast`):
-
-```bash
-python train_student.py \
-  --path_t ./save/models/resnet32x4_vanilla/ckpt_epoch_240.pth \
-  --distill rdx_contrast \
-  --model_s resnet8x4 \
-  -a 0 -b 0.8 \
-  --sampling curriculum \
-  --curriculum_start_frac 0.3 \
-  --curriculum_pace_epochs 100 \
-  --trial 1
-```
-
-**Periodic re-scoring** (refresh contrast pairs every 20 epochs after `--rdx_start_epoch`; triplet table refreshes the same way for `rdx_triplet`):
-
-```bash
-python train_student.py \
-  --path_t ./save/models/resnet32x4_vanilla/ckpt_epoch_240.pth \
-  --distill rdx_contrast \
-  --model_s resnet8x4 \
-  -a 0 -b 0.8 \
-  --rdx_start_epoch 1 \
-  --rdx_refresh_epochs 20 \
-  --trial 1
-```
-
-**Faster RDX scoring** (use 2048 anchor images instead of the full training set when mining):
-
-```bash
-python train_student.py \
-  --path_t ./save/models/resnet32x4_vanilla/ckpt_epoch_240.pth \
-  --distill rdx_contrast \
-  --model_s resnet8x4 \
-  -a 0 -b 0.8 \
-  --rdx_anchor_n 2048 \
-  --trial 1
-```
-
-
-| Flag                                       | Description                                                                    |
-| ------------------------------------------ | ------------------------------------------------------------------------------ |
-| `--sampling`                               | `standard` (default) or `curriculum` for RDX difficulty-based curriculum       |
-| `--curriculum_start_frac`                  | Initial fraction of easiest (RDX-scored) samples (default: `0.3`)              |
-| `--curriculum_pace_epochs`                 | Epochs to ramp from that fraction to the full set (default: `100`)             |
-| `--rdx_start_epoch`                        | First epoch at which RDX tables / curriculum use scored subsets (default: `1`) |
-| `--rdx_refresh_epochs`                     | Re-mine every N epochs (`0` = once; default: `0`)                              |
-| `--rdx_anchor_n`                           | Number of anchor images for scoring (`0` = all; default: `0`)                  |
-| `--rdx_gamma`, `--rdx_beta`, `--rdx_kna_k` | RDX affinity / curriculum hyperparameters (see `train_student.py`)             |
-
-
-### 3. Combine RDD with KD
-
-```bash
-python train_student.py \
-  --path_t ./save/models/resnet32x4_vanilla/ckpt_epoch_240.pth \
-  --distill rdx_contrast \
-  --model_s resnet8x4 \
-  -a 1 -b 0.8 \
-  --trial 1
-```
-
-### 4. (Optional) Train teacher networks from scratch
-
-```bash
-sh scripts/run_cifar_vanilla.sh
-```
-
-## Benchmark Results on CIFAR-100
-
-Performance is measured by top-1 classification accuracy (%). Results are shown in the paper.
-
-## Project Structure
+## Project structure
 
 ```
-├── train_student.py          # Main training script
+├── train_student.py              # Main training script
 ├── distiller_zoo/
-│   ├── RDXContrast.py                # RDDLoss: affinity matrices, memory bank,
-│   └── ...                   # Other distillation methods (KD, CRD, etc.)
-├── models/                   # Teacher and student architectures
-├── dataset/                  # CIFAR-100 data loading
-├── scripts/                  # Shell scripts for training
-└── save/                     # Checkpoints and logs
+│   ├── RDXContrast.py            # RDD loss: RDX-weighted contrastive loss over the memory bank
+│   └── ...                       # Other distillation methods (KD, CRD, RKD, ...)
+├── rdx/sampling.py               # RDX math: ranks, locally-biased difference, A01/A10, lookup tables
+├── helper/rdx_utils.py           # Embedding extraction + RDX refresh orchestration
+├── crd/                          # CRD memory bank and projection heads
+├── models/                       # Teacher and student architectures
+├── dataset/                      # CIFAR-100 loaders (incl. RDX-indexed variants)
+├── scripts/                      # Training, export and figure scripts
+└── save/                         # Checkpoints and TensorBoard logs
 ```
+
+The overview figure is generated by `scripts/plot_overview_figure_v4.py` (uses the bundled Fira Sans fonts in `assets/fonts/`, SIL Open Font License).
 
 ## Maintainers
 
-- **AbdulKarim Mugisha**
-- **Divin Irakiza** — [divinrkz](https://divinrkz.com)
+- **Abdulkarim Mugisha**
+- **Divin Irakiza**: [divinrkz](https://divinrkz.com)
 
-## Acknowledgement
+## Acknowledgements
 
-The starter code for this project was adapted from the [RepDistiller](https://github.com/HobbitLong/RepDistiller) repository by Yonglong Tian, which accompanies the ICLR 2020 paper *Contrastive Representation Distillation* (CRD). We thank the original authors for making their codebase and pretrained models publicly available.
+The starter code was adapted from [RepDistiller](https://github.com/HobbitLong/RepDistiller) by
+Yonglong Tian (BSD 2-Clause License, see `LICENSE`), which accompanies *Contrastive Representation
+Distillation* (ICLR 2020). We thank the authors for releasing their code and pretrained teachers.
+
+The code in `rdx/` reimplements the rank normalization, locally-biased difference and affinities of
+*Representational Difference Explanations* (Kondapaneni, Mac Aodha and Perona, NeurIPS 2025).
 
 ## Citation
 
 ```bibtex
-@article{keza2026rdd,
-  title={Representation Difference Distillation},
-  author={Irakiza, Divin and Mugisha, AbdulKarim},
-  year={2026}
+@misc{mugisha2026rdd,
+  title  = {Representational Difference Distillation},
+  author = {Mugisha, Abdulkarim and Irakiza, Divin},
+  year   = {2026}
 }
 ```
-
